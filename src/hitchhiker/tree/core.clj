@@ -102,7 +102,7 @@
   [children]
   (mapv last-key (butlast children)))
 
-(defrecord IndexNode [children storage-addr op-buf cfg]
+(defrecord IndexNode [children storage-addr op-buf cfg lookup-cache!]
   IResolve
   (index? [this] true)
   (dirty? [this] (not (realized? storage-addr)))
@@ -124,24 +124,31 @@
       (->Split (->IndexNode (subvec children 0 b)
                             (promise)
                             (vec left-buf)
-                            cfg)
+                            cfg
+                            (atom nil))
                (->IndexNode (subvec children b)
                             (promise)
                             (vec right-buf)
-                            cfg)
+                            cfg
+                            (atom nil))
               median)))
   (merge-node [this other]
     (->IndexNode (catvec children (:children other))
                  (promise)
                  (catvec op-buf (:op-buf other))
-                 cfg))
+                 cfg
+                 (atom nil)))
   (lookup [root key]
     ;;This is written like so because it's performance critical
-    (let [l (dec (count children))
-          a (object-array l)
-          _ (dotimes [i l]
-              (aset a i (last-key (nth children i))))
-          x (Arrays/binarySearch a 0 l key compare)]
+    (when-not @lookup-cache!
+      (swap! lookup-cache!
+             (fn [_]
+               (let [l (dec (count children))
+                     a (object-array l)
+                     _ (dotimes [i l]
+                         (aset a i (last-key (nth children i))))]
+                 a))))
+    (let [x (Arrays/binarySearch @lookup-cache! 0 (dec (count @lookup-cache!)) key compare)]
       (if (neg? x)
         (- (inc x))
         x))))
@@ -159,7 +166,7 @@
                    (let [cfg (nippy/thaw-from-in! data-input)
                          children (nippy/thaw-from-in! data-input)
                          op-buf (nippy/thaw-from-in! data-input)]
-                     (->IndexNode children nil op-buf cfg)))
+                     (->IndexNode children nil op-buf cfg (atom nil))))
 
 (defn index-node?
   [node]
@@ -213,17 +220,19 @@
   [set index]
   (first (drop index set)))
 
-(defrecord DataNode [children storage-addr cfg]
+(defrecord DataNode [children storage-addr cfg last-key-cache!]
   IResolve
   (index? [this] false)
   (resolve [this] this) ;;TODO this is a hack for testing
   (dirty? [this] (not (realized? storage-addr)))
   (last-key [this]
-    (when (seq children)
-      (-> children
-          (rseq)
-          (first)
-          (key))))
+    (if @last-key-cache!
+      @last-key-cache!
+      (reset! last-key-cache! (when (seq children)
+                                (-> children
+                                    (rseq)
+                                    (first)
+                                    (key))))))
   INode
   ;; Should have between b & 2b-1 children
   (overflow? [this]
@@ -245,7 +254,7 @@
 (defn data-node
   "Creates a new data node"
   [cfg children]
-  (->DataNode children (promise) cfg))
+  (->DataNode children (promise) cfg (atom nil)))
 
 (defn data-node?
   [node]
@@ -260,7 +269,7 @@
                    [data-input]
                    (let [cfg (nippy/thaw-from-in! data-input)
                          children (nippy/thaw-from-in! data-input)]
-                     (->DataNode children nil cfg)))
+                     (->DataNode children nil cfg (atom nil))))
 
 ;(println (b-tree :foo :bar :baz))
 ;(pp/pprint (apply b-tree (range 100)))
@@ -326,8 +335,8 @@
                                          new-sibling))
           path-suffix (-> (interleave sibling-lineage
                                       (repeat 0))
-                          (butlast)) ; butlast ensures we end w/ node
-          ]
+                          (butlast))] ; butlast ensures we end w/ node
+
       (-> (pop common-parent-path)
           (conj next-index)
           (into path-suffix)))))
@@ -350,8 +359,8 @@
   "Given a B-tree and a key, gets a path into the tree"
   [tree key]
   (loop [path [tree] ;alternating node/index/node/index/node... of the search taken
-         cur tree ;current search node
-         ]
+         cur tree] ;current search node
+
     (if (seq (:children cur))
       (if (data-node? cur)
         path
@@ -393,7 +402,7 @@
       (if (empty? path)
         (if (overflow? node)
           (let [{:keys [left right median]} (split-node node)]
-            (->IndexNode [left right] (promise) [] cfg))
+            (->IndexNode [left right] (promise) [] cfg (atom nil)))
           node)
         (let [index (peek path)
               {:keys [children keys] :as parent} (peek (pop path))]
@@ -452,18 +461,21 @@
                                               old-right-children)
                                       (promise)
                                       op-buf
-                                      cfg)
+                                      cfg
+                                      (atom nil))
                          (pop (pop path))))
                 (recur (->IndexNode (catvec (conj old-left-children merged)
                                             old-right-children)
                                     (promise)
                                     op-buf
-                                    cfg)
+                                    cfg
+                                    (atom nil))
                        (pop (pop path)))))
             (recur (->IndexNode (assoc children index node)
                                 (promise)
                                 op-buf
-                                cfg)
+                                cfg
+                                (atom nil))
                    (pop (pop path)))))))))
 
 (defn b-tree
@@ -527,7 +539,7 @@
   (write-node [_ node session]
     (swap! session update-in [:writes] inc)
     (->TestingAddr (last-key node) node))
-  (delete-addr [_ addr session ]))
+  (delete-addr [_ addr session]))
 
 (defn flush-tree
   "Given the tree, finds all dirty nodes, delivering addrs into them.

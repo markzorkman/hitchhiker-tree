@@ -181,11 +181,11 @@
           right-side-filter (if is-last?
                               identity
                               (take-while #(>= 0 (core/compare (affects-key %) my-last))))
-          correct-ops (into [] (comp left-sib-filter right-side-filter) ops)
+          correct-ops (into [] (comp left-sib-filter right-side-filter) ops)]
 
           ;;We include op if leq my left, and not if leq left's left
           ;;TODO we can't apply all ops, we should ensure to only apply ops whose keys are in the defined range, unless we're the last sibling
-          ]
+
       ;(println "left-sibs-min-last" left-sibs-min-last)
       ;(println "is-last?" is-last?)
       ;(println "expanding data node" data-node "with ops" correct-ops)
@@ -205,14 +205,14 @@
 (defn insert
   [tree key value]
   (enqueue tree [(assoc (->InsertOp key value)
-                        :tag (java.util.UUID/randomUUID)
-                        )]))
+                        :tag (java.util.UUID/randomUUID))]))
+
 
 (defn delete
   [tree key]
   (enqueue tree [(assoc (->DeleteOp key)
-                        :tag (java.util.UUID/randomUUID)
-                        )]))
+                        :tag (java.util.UUID/randomUUID))]))
+
 
 (defn forward-iterator
   "Takes the result of a search and returns an iterator going
