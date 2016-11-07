@@ -102,7 +102,7 @@
   [children]
   (mapv last-key (butlast children)))
 
-(defrecord IndexNode [children storage-addr op-buf cfg lookup-cache!]
+(defrecord IndexNode [children storage-addr op-buf cfg]
   IResolve
   (index? [this] true)
   (dirty? [this] (not (realized? storage-addr)))
@@ -124,31 +124,24 @@
       (->Split (->IndexNode (subvec children 0 b)
                             (promise)
                             (vec left-buf)
-                            cfg
-                            (atom nil))
+                            cfg)
                (->IndexNode (subvec children b)
                             (promise)
                             (vec right-buf)
-                            cfg
-                            (atom nil))
+                            cfg)
               median)))
   (merge-node [this other]
     (->IndexNode (catvec children (:children other))
                  (promise)
                  (catvec op-buf (:op-buf other))
-                 cfg
-                 (atom nil)))
+                 cfg))
   (lookup [root key]
     ;;This is written like so because it's performance critical
-    (when-not @lookup-cache!
-      (swap! lookup-cache!
-             (fn [_]
-               (let [l (dec (count children))
-                     a (object-array l)
-                     _ (dotimes [i l]
-                         (aset a i (last-key (nth children i))))]
-                 a))))
-    (let [x (Arrays/binarySearch @lookup-cache! 0 (dec (count @lookup-cache!)) key compare)]
+    (let [l (dec (count children))
+          a (object-array l)
+          _ (dotimes [i l]
+              (aset a i (last-key (nth children i))))
+          x (Arrays/binarySearch a 0 l key compare)]
       (if (neg? x)
         (- (inc x))
         x))))
@@ -166,7 +159,7 @@
                    (let [cfg (nippy/thaw-from-in! data-input)
                          children (nippy/thaw-from-in! data-input)
                          op-buf (nippy/thaw-from-in! data-input)]
-                     (->IndexNode children nil op-buf cfg (atom nil))))
+                     (->IndexNode children nil op-buf cfg)))
 
 (defn index-node?
   [node]
@@ -220,19 +213,17 @@
   [set index]
   (first (drop index set)))
 
-(defrecord DataNode [children storage-addr cfg last-key-cache!]
+(defrecord DataNode [children storage-addr cfg]
   IResolve
   (index? [this] false)
   (resolve [this] this) ;;TODO this is a hack for testing
   (dirty? [this] (not (realized? storage-addr)))
   (last-key [this]
-    (if @last-key-cache!
-      @last-key-cache!
-      (reset! last-key-cache! (when (seq children)
-                                (-> children
-                                    (rseq)
-                                    (first)
-                                    (key))))))
+    (when (seq children)
+      (-> children
+          (rseq)
+          (first)
+          (key))))
   INode
   ;; Should have between b & 2b-1 children
   (overflow? [this]
@@ -254,7 +245,7 @@
 (defn data-node
   "Creates a new data node"
   [cfg children]
-  (->DataNode children (promise) cfg (atom nil)))
+  (->DataNode children (promise) cfg))
 
 (defn data-node?
   [node]
@@ -269,7 +260,7 @@
                    [data-input]
                    (let [cfg (nippy/thaw-from-in! data-input)
                          children (nippy/thaw-from-in! data-input)]
-                     (->DataNode children nil cfg (atom nil))))
+                     (->DataNode children nil cfg)))
 
 ;(println (b-tree :foo :bar :baz))
 ;(pp/pprint (apply b-tree (range 100)))
@@ -402,7 +393,7 @@
       (if (empty? path)
         (if (overflow? node)
           (let [{:keys [left right median]} (split-node node)]
-            (->IndexNode [left right] (promise) [] cfg (atom nil)))
+            (->IndexNode [left right] (promise) [] cfg))
           node)
         (let [index (peek path)
               {:keys [children keys] :as parent} (peek (pop path))]
@@ -461,21 +452,18 @@
                                               old-right-children)
                                       (promise)
                                       op-buf
-                                      cfg
-                                      (atom nil))
+                                      cfg)
                          (pop (pop path))))
                 (recur (->IndexNode (catvec (conj old-left-children merged)
                                             old-right-children)
                                     (promise)
                                     op-buf
-                                    cfg
-                                    (atom nil))
+                                    cfg)
                        (pop (pop path)))))
             (recur (->IndexNode (assoc children index node)
                                 (promise)
                                 op-buf
-                                cfg
-                                (atom nil))
+                                cfg)
                    (pop (pop path)))))))))
 
 (defn b-tree
