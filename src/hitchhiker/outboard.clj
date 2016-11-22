@@ -181,12 +181,12 @@
     (reset! (:tree-atom new-conn) flushed-snapshot)
     new-conn))
 
-#_(defn extend-lifetime
+#_(defn extend-lifetime)
   "Ensures the given snapshot will be readable for at least additional-ms longer."
   ;;TODO this is complex b/c we need to find all the reachable non-dirty nodes, and either add or extend their lifetimes...
   [snapshot additional-ms]
   ;((wcar {} (car/zincrby (re))))
-  )
+
 
 (comment
   ;First we'll create a new tree
@@ -218,6 +218,6 @@
   (wcar {} (car/zrange "refcount:expiry" 0 -1))
   (wcar {} (car/hget "named-hhs" "my-tree"))
   (wcar {} (car/hget "named-hhs" "other-tree"))
-  (wcar {} (car/get (str (wcar {} (car/hget "named-hhs" "my-tree")) ":rc")))
+  (wcar {} (car/get (str (wcar {} (car/hget "named-hhs" "my-tree")) ":rc"))))
 
-  )
+

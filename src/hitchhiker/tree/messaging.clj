@@ -60,71 +60,77 @@
   [op]
   (print op))
 
-(defn enqueue
-  ([tree msgs]
-   (let [deferred-ops (atom [])
-         msg-buffers-propagated (enqueue tree msgs deferred-ops)]
-     ;(when (seq @deferred-ops) (println "appyling deferred ops" @deferred-ops))
-     (reduce (fn [tree op]
-               (apply-op-to-tree op tree))
-             msg-buffers-propagated
-             @deferred-ops)))
-  ([tree msgs deferred-ops]
-   ;(println "tree is" (class tree) tree)
-   (let [tree (core/resolve tree)]
-     (cond
-       (core/data-node? tree) ; need to return ops to apply to the tree proper...
-       (do (swap! deferred-ops into msgs)
-           tree)
-       (<= (+ (count msgs) (count (:op-buf tree)))
-           (get-in tree [:cfg :op-buf-size])) ; will there be enough space?
-       (-> tree
-           (core/dirty!)
-           (update-in [:op-buf] into msgs))
-       :else ; overflow, should be IndexNode
-       (do (assert (core/index-node? tree))
-           ;(println "overflowing node" (:keys tree) "with buf" (:op-buf tree)
-           ;         "with new msgs" msgs
-           ;         )
-           (loop [[child & children] (:children tree)
-                  rebuilt-children []
-                  msgs (vec (sort-by affects-key ;must be a stable sort
-                                     (concat (:op-buf tree) msgs)))]
-             (let [took-msgs (into []
-                                   (take-while #(>= 0 (core/compare
-                                                        (affects-key %)
-                                                        (core/last-key child))))
-                                   msgs)
-                   extra-msgs (into []
+(defn enqueue3 [tree msgs deferred-ops]
+  (let [tree (core/resolve tree)]
+    (cond
+      (core/data-node? tree) ; need to return ops to apply to the tree proper...
+      (do (swap! deferred-ops into msgs)
+          tree)
+      (<= (+ (count msgs) (count (:op-buf tree)))
+          (get-in tree [:cfg :op-buf-size])) ; will there be enough space?
+      (-> tree
+          (core/dirty!)
+          (update-in [:op-buf] into msgs))
+      :else ; overflow, should be IndexNode
+      (do (assert (core/index-node? tree))
+          ;(println "overflowing node" (:keys tree) "with buf" (:op-buf tree)
+          ;         "with new msgs" msgs
+          ;         )
+          (loop [[child & children] (:children tree)
+                 rebuilt-children []
+                 msgs (vec (sort-by affects-key ;must be a stable sort
+                                    (concat (:op-buf tree) msgs)))]
+            (let [took-msgs (into []
+                                  (take-while #(>= 0 (core/compare
+                                                       (affects-key %)
+                                                       (core/last-key child))))
+                                  msgs)
+                  extra-msgs (into []
                                    (drop-while #(>= 0 (core/compare
                                                         (affects-key %)
                                                         (core/last-key child))))
                                    msgs)
-                   ;_ (println "last-key:" (core/last-key child))
-                   ;_ (println "goes left:" took-msgs)
-                   ;_ (println "goes right:" extra-msgs)
-                   on-the-last-child? (empty? children)
+                  ;_ (println "last-key:" (core/last-key child))
+                  ;_ (println "goes left:" took-msgs)
+                  ;_ (println "goes right:" extra-msgs)
+                  on-the-last-child? (empty? children)
 
-                   ;; Any changes to the current child?
-                   new-child
-                   (cond
-                     (and on-the-last-child? (seq extra-msgs))
-                     (enqueue (core/resolve child)
+                  ;; Any changes to the current child?
+                  new-child
+                  (cond
+                    (and on-the-last-child? (seq extra-msgs))
+                    (enqueue3 (core/resolve child)
                               (catvec took-msgs extra-msgs)
                               deferred-ops)
-                     (seq took-msgs) ; save a write
-                     (enqueue (core/resolve child)
+                    (seq took-msgs) ; save a write
+                    (enqueue3 (core/resolve child)
                               took-msgs
                               deferred-ops)
-                     :else
-                     child)]
+                    :else
+                    child)]
 
-               (if on-the-last-child?
-                 (-> tree
-                     (assoc :children (conj rebuilt-children new-child))
-                     (assoc :op-buf [])
-                     (core/dirty!))
-                 (recur children (conj rebuilt-children new-child) extra-msgs)))))))))
+              (if on-the-last-child?
+                (-> tree
+                    (assoc :children (conj rebuilt-children new-child))
+                    (assoc :op-buf [])
+                    (core/dirty!))
+                (recur children (conj rebuilt-children new-child) extra-msgs))))))))
+
+(defn enqueue2 [tree msgs]
+  (let [deferred-ops (atom [])
+        msg-buffers-propagated (enqueue3 tree msgs deferred-ops)]
+    ;(when (seq @deferred-ops) (println "appyling deferred ops" @deferred-ops))
+    (reduce (fn [tree op]
+              (apply-op-to-tree op tree))
+            msg-buffers-propagated
+            @deferred-ops)))
+
+(defn enqueue
+  ([tree msgs]
+   (enqueue2 tree msgs))
+  ([tree msgs deferred-ops]
+   ;(println "tree is" (class tree) tree)
+   (enqueue3 tree msgs deferred-ops)))
 
 
 ;;TODO delete in core needs to stop using the index-node constructor to be more
@@ -144,7 +150,7 @@
                    (into [] (comp (filter core/index-node?)
                                   (map :op-buf)))
                    (rseq) ; highest node should be last in seq
-                   (apply catvec)
+                   (apply concat)
                    (sort-by affects-key)) ;must be a stable sort
           this-node-index (-> path pop peek)
           parent (-> path pop pop peek)
@@ -202,10 +208,13 @@
          expanded (apply-ops-in-path path)]
      (get expanded key not-found))))
 
+(def uuid (java.util.UUID/randomUUID))
+(def counter! (atom 0))
+
 (defn insert
   [tree key value]
   (enqueue tree [(assoc (->InsertOp key value)
-                        :tag (java.util.UUID/randomUUID))]))
+                        :tag (str uuid ":" (swap! counter! inc)))]))
 
 
 (defn delete

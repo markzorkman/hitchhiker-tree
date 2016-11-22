@@ -2,9 +2,11 @@
   (:refer-clojure :exclude [compare resolve subvec])
   (:require [clojure.core.rrb-vector :refer [catvec subvec]]
             [clojure.pprint :as pp]
-            [taoensso.nippy :as nippy])
+            [taoensso.nippy :as nippy]
+            [clojure.data.avl :as avl])
   (:import java.io.Writer
-           [java.util Arrays Collections]))
+           [java.util Arrays Collections]
+           (clojure.lang PersistentTreeMap Associative Counted IPersistentCollection IEditableCollection ITransientCollection)))
 
 (defrecord Config [index-b data-b op-buf-size])
 
@@ -102,14 +104,32 @@
   [children]
   (mapv last-key (butlast children)))
 
-(defrecord IndexNode [children storage-addr op-buf cfg]
+(defn op-buf-comparator [a b]
+  (compare (:key a) (:key b)))
+
+
+(defrecord IndexNode [children storage-addr op-buf cfg cache!]
+  IEditableCollection
+  (asTransient [this] this)
+  ITransientCollection
+  (persistent [this] (IndexNode. (mapv #(if (dirty? %)
+                                          (persistent! %)
+                                          %)
+                                       children)
+                                 storage-addr
+                                 op-buf
+                                 cfg
+                                 cache!))
   IResolve
   (index? [this] true)
   (dirty? [this] (not (realized? storage-addr)))
   (resolve [this] this) ;;TODO this is a hack for testing
   (last-key [this]
     ;;TODO should optimize by caching to reduce IOps (can use monad)
-    (last-key (peek children)))
+    (if-let [last-key (:last-key @cache!)]
+      last-key
+      (:last-key (swap! cache! assoc :last-key
+                        (last-key (peek children))))))
   INode
   (overflow? [this]
     (>= (count children) (* 2 (:index-b cfg))))
@@ -120,21 +140,25 @@
           median (nth (index-node-keys children) (dec b))
           [left-buf right-buf] (split-with #(not (pos? (compare (:key %) median)))
                                            ;;TODO this should use msg/affects-key
-                                           (sort-by :key op-buf))]
+                                           op-buf)]
       (->Split (->IndexNode (subvec children 0 b)
                             (promise)
-                            (vec left-buf)
-                            cfg)
+                            (apply avl/sorted-set-by op-buf-comparator left-buf)
+                            cfg
+                            (atom {}))
                (->IndexNode (subvec children b)
                             (promise)
-                            (vec right-buf)
-                            cfg)
+                            (apply avl/sorted-set-by op-buf-comparator right-buf)
+                            cfg
+                            (atom {}))
               median)))
   (merge-node [this other]
     (->IndexNode (catvec children (:children other))
                  (promise)
-                 (catvec op-buf (:op-buf other))
-                 cfg))
+                 (into (avl/sorted-set-by op-buf-comparator)
+                       (concat op-buf (:op-buf other)))
+                 cfg
+                 (atom {})))
   (lookup [root key]
     ;;This is written like so because it's performance critical
     (let [l (dec (count children))
@@ -159,7 +183,7 @@
                    (let [cfg (nippy/thaw-from-in! data-input)
                          children (nippy/thaw-from-in! data-input)
                          op-buf (nippy/thaw-from-in! data-input)]
-                     (->IndexNode children nil op-buf cfg)))
+                     (->IndexNode children nil (apply avl/sorted-set-by op-buf-comparator op-buf) cfg (atom {}))))
 
 (defn index-node?
   [node]
@@ -213,17 +237,27 @@
   [set index]
   (first (drop index set)))
 
-(defrecord DataNode [children storage-addr cfg]
+(defrecord DataNode [children storage-addr cfg cache!]
+  IEditableCollection
+  (asTransient [_]
+    (DataNode. (transient children) storage-addr cfg cache!))
+  ITransientCollection
+  (persistent [this]
+    (if (instance? ITransientCollection children)
+      (DataNode. (persistent! children) storage-addr cfg cache!)
+      this))
   IResolve
   (index? [this] false)
   (resolve [this] this) ;;TODO this is a hack for testing
   (dirty? [this] (not (realized? storage-addr)))
   (last-key [this]
-    (when (seq children)
-      (-> children
-          (rseq)
-          (first)
-          (key))))
+    (if-let [last-key (:last-key @cache!)]
+      last-key
+      (:last-key (swap! cache! assoc :last-key
+                   (let [c (count children)]
+                     (if (zero? c)
+                       nil
+                       (key (nth children (dec c)))))))))
   INode
   ;; Should have between b & 2b-1 children
   (overflow? [this]
@@ -231,21 +265,31 @@
   (underflow? [this]
     (< (count children) (:data-b cfg)))
   (split-node [this]
-    (->Split (data-node cfg (into (sorted-map-by compare) (take (:data-b cfg)) children))
-             (data-node cfg (into (sorted-map-by compare) (drop (:data-b cfg)) children))
-             (nth-of-set children (dec (:data-b cfg)))))
+    (let [children (if (instance? ITransientCollection children)
+                     (persistent! children)
+                     children)]
+      (let [[left right] (avl/split-at (:data-b cfg) children)]
+        (->Split (data-node cfg left)
+                 (data-node cfg right)
+                 (nth children (dec (:data-b cfg)))))))
   (merge-node [this other]
     (data-node cfg (into children (:children other))))
   (lookup [root key]
-    (let [x (Collections/binarySearch (vec (keys children)) key compare)]
-      (if (neg? x)
-        (- (inc x))
-        x))))
+    (if-let [result (get children key)]
+            result
+            -1)
+    #_(let [x (Collections/binarySearch (vec (keys children)) key compare)]
+        (if (neg? x)
+          (- (inc x))
+          x))))
 
 (defn data-node
   "Creates a new data node"
   [cfg children]
-  (->DataNode children (promise) cfg))
+  (let [children (if (instance? PersistentTreeMap children)
+                  (into (avl/sorted-map-by compare) children)
+                  children)]
+    (->DataNode children (promise) cfg (atom {}))))
 
 (defn data-node?
   [node]
@@ -254,13 +298,14 @@
 (nippy/extend-freeze DataNode :b-tree/data-node
                      [{:keys [cfg children]} data-output]
                      (nippy/freeze-to-out! data-output cfg)
-                     (nippy/freeze-to-out! data-output children))
+                     (nippy/freeze-to-out! data-output (object-array children)))
 
 (nippy/extend-thaw :b-tree/data-node
                    [data-input]
                    (let [cfg (nippy/thaw-from-in! data-input)
-                         children (nippy/thaw-from-in! data-input)]
-                     (->DataNode children nil cfg)))
+                         children (into (avl/sorted-map-by compare)
+                                        (nippy/thaw-from-in! data-input))]
+                     (->DataNode children nil cfg (atom {}))))
 
 ;(println (b-tree :foo :bar :baz))
 ;(pp/pprint (apply b-tree (range 100)))
@@ -352,7 +397,7 @@
   (loop [path [tree] ;alternating node/index/node/index/node... of the search taken
          cur tree] ;current search node
 
-    (if (seq (:children cur))
+    (if-not (= 0 (count (:children cur)))
       (if (data-node? cur)
         path
         (let [index (lookup cur key)
@@ -383,35 +428,44 @@
     (when path
       (forward-iterator path key))))
 
+(defn update-data-node [cfg children key value]
+  (if (instance? ITransientCollection children)
+    (data-node cfg (assoc! children key value))
+    (data-node cfg (assoc children key value))))
+
+(defn update-path [cfg updated-data-node path]
+  (loop [node updated-data-node
+         path (pop path)]
+    (if (empty? path)
+      (if (overflow? node)
+        (let [{:keys [left right median]} (split-node node)]
+          (->IndexNode [left right] (promise) [] cfg (atom {})))
+        node)
+      (let [index (peek path)
+            {:keys [children keys] :as parent} (peek (pop path))]
+        (if (overflow? node) ; splice the split into the parent
+          ;;TODO refactor paths to be node/index pairs or 2 vectors or something
+          (let [{:keys [left right median]} (split-node node)
+                new-children (catvec (conj (subvec children 0 index)
+                                           left right)
+                                     (subvec children (inc index)))]
+            (recur (-> parent
+                       (assoc :children new-children)
+                       (dirty!))
+                   (pop (pop path))))
+          (recur (-> parent
+                     ;;TODO this assoc-in seems to be a bottleneck
+                     (assoc-in [:children index] node)
+                     (dirty!))
+                 (pop (pop path))))))))
+
 (defn insert
   [{:keys [cfg] :as tree} key value]
   (let [path (lookup-path tree key)
-        {:keys [children] :or {children (sorted-map-by compare)}} (peek path)
-        updated-data-node (data-node cfg (assoc children key value))]
-    (loop [node updated-data-node
-           path (pop path)]
-      (if (empty? path)
-        (if (overflow? node)
-          (let [{:keys [left right median]} (split-node node)]
-            (->IndexNode [left right] (promise) [] cfg))
-          node)
-        (let [index (peek path)
-              {:keys [children keys] :as parent} (peek (pop path))]
-          (if (overflow? node) ; splice the split into the parent
-            ;;TODO refactor paths to be node/index pairs or 2 vectors or something
-            (let [{:keys [left right median]} (split-node node)
-                  new-children (catvec (conj (subvec children 0 index)
-                                             left right)
-                                       (subvec children (inc index)))]
-              (recur (-> parent
-                         (assoc :children new-children)
-                         (dirty!))
-                     (pop (pop path))))
-            (recur (-> parent
-                       ;;TODO this assoc-in seems to be a bottleneck
-                       (assoc-in [:children index] node)
-                       (dirty!))
-                   (pop (pop path)))))))))
+        {:keys [children] :or {children (avl/sorted-map-by compare)}} (peek path)
+        updated-data-node (update-data-node cfg children key value)]
+    (update-path cfg updated-data-node path)))
+
 
 ;;TODO: cool optimization: when merging children, push as many operations as you can
 ;;into them to opportunisitcally minimize overall IO costs
@@ -419,8 +473,10 @@
 (defn delete
   [{:keys [cfg] :as tree} key]
   (let [path (lookup-path tree key) ; don't care about the found key or its index
-        {:keys [children] :or {children (sorted-map-by compare)}} (peek path)
-        updated-data-node (data-node cfg (dissoc children key))]
+        {:keys [children] :or {children (avl/sorted-map-by compare)}} (peek path)
+        updated-data-node (data-node cfg (if (instance? ITransientCollection children)
+                                           (dissoc! children key)
+                                           (dissoc children key)))]
     (loop [node updated-data-node
            path (pop path)]
       (if (empty? path)
@@ -452,25 +508,28 @@
                                               old-right-children)
                                       (promise)
                                       op-buf
-                                      cfg)
+                                      cfg
+                                      (atom {}))
                          (pop (pop path))))
                 (recur (->IndexNode (catvec (conj old-left-children merged)
                                             old-right-children)
                                     (promise)
                                     op-buf
-                                    cfg)
+                                    cfg
+                                    (atom {}))
                        (pop (pop path)))))
             (recur (->IndexNode (assoc children index node)
                                 (promise)
                                 op-buf
-                                cfg)
+                                cfg
+                                (atom {}))
                    (pop (pop path)))))))))
 
 (defn b-tree
   [cfg & kvs]
   (reduce (fn [t [k v]]
             (insert t k v))
-          (data-node cfg (sorted-map-by compare))
+          (data-node cfg (avl/sorted-map-by compare))
           (partition 2 kvs)))
 
 (defrecord TestingAddr [last-key node]
